@@ -12,7 +12,7 @@ end
 using Images
 using ArgParse
 
-function run()
+function main()
     println("starting...")
     parsed_args = parse_commandline()
     println("running with following arguments : ")
@@ -39,10 +39,15 @@ function run()
 
     start_time = time()
 
-
+    #  we keep track of a list of available points (we want to 'randomly' sample, so a list-like 
+    #  structure is needed here).  Instead of deleting available points when we use them, which
+    #  be expensive, we keep track of those that we have deleted, and periodically refresh the
+    #  available set list without the deleted points.  Finally, we keep track of those that we 
+    #  have ever added to make sure we 
     available_points = Voxel[]
-    ever_seen = Set{Voxel}() 
     deleted_points = Set{Voxel}()
+    ever_seen = Set{Voxel}() 
+    
 
     score_sum :: Int64 = 0
 
@@ -138,7 +143,7 @@ Color_() = Color_(-1,-1,-1)
 
 # we store the color of the voxel, and the sum of the norms, and sum of 
 # red, green, blue components.  This means calculating the distance to a color can
-# be done in one line, rather than iterating through all the neighbours
+# be done in one pass, rather than iterating through all the neighbours
 type Voxel
     x :: Int16
     y :: Int16
@@ -165,8 +170,10 @@ function get_color_list(SIDE, FRAMES, SORT_TYPE)
         const colors = all_colors
     elseif SORT_TYPE == "random"
         const colors = shuffle(all_colors)
-    elseif SORT_TYPE == "hsv"
-        const colors = sort(all_colors, by = get_hsv_score)
+    elseif SORT_TYPE == "hue"
+        const colors = sort(all_colors, by = get_hue)
+    elseif SORT_TYPE == "brightness"
+        const colors = sort(all_colors, by = get_brightness)
     else
         error("bad sort type argument : $(SORT_TYPE)")
     end
@@ -211,6 +218,11 @@ function find_best_point(available_pts :: Array{Voxel,1}, deleted_points :: Set{
     best_index = 0
     n = 1
 
+    #  I found that randomly sampling the available points was too slow (may be that 
+    #  I was using the wrong function though).  Instead, I choose an 'arithmetic progression'
+    #  of the indices at random.  The list is getting shuffled semi regularly, so hopefully
+    #  there isn't too much dependence between available points here
+
     step_size = max(itrunc(length(available_pts) / MAX_SAMPLES) , 1)
     index = rand(1 : step_size)
 
@@ -244,11 +256,15 @@ end
 
 function get_color_distance(vxl :: Voxel, c :: Color_, avg :: Bool)
     if vxl.num_neighbours == 0
-        return 0
+        return -1073741824
     end
     out = vxl.color_square_sum - c.r * vxl.red_sum - c.g * vxl.green_sum - c.b * vxl.blue_sum
-    div(out, vxl.num_neighbours)
-    #out
+
+    # integer division for small speedup
+    #div(out, vxl.num_neighbours)
+
+    # uncomment next line if you want average assuming all the unfilled neighbours are black (gives odd effect)
+    out
 end
 
 function set_color(vxl :: Voxel, c:: Color_)
@@ -266,7 +282,7 @@ function reset_array(array, to_delete)
             push!(out, vxl)
         end
     end
-    out
+    shuffle(out)
 end
 
 function add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, available_points, ever_seen)
@@ -306,7 +322,6 @@ function color_neighbour_and_update_sets(n, c, available_points, ever_seen)
         add_neighbour_color(n, c)
     end
     if !in(n, ever_seen)
-        # available_points = insert_into(available_points, n)  
         push!(available_points, n)
     end
     push!(ever_seen, n)
@@ -326,17 +341,6 @@ function mod(n, r)
     else
         return (n + r) % r
     end
-end
-
-function update_available(available_points, deleted_points)
-    new_avail = Set{Voxel}()
-    for vxl in available_points
-        if !in(vxl, deleted_points)
-            push!(new_avail, vxl)
-        end
-    end
-    println(length(available_points) - length(deleted_points), "_", length(new_avail))
-    new_avail
 end
 
 function make_images(a :: Array{Voxel,3}, out_dir)
@@ -367,8 +371,8 @@ function get_colour(vxl :: Voxel, i )
     end
 end
 
-##  WARNING --- this is liable to be buggy!!! 
-function get_hsv_score(c)
+##  TODO : check this
+function get_hue(c)
     r,g,b = c.r, c.g, c.b
     R = r / 256
     G = g / 256
@@ -392,23 +396,19 @@ function get_hsv_score(c)
        h += 6
     end
 
-    v = (R + G + B) / 3
-
-    if C == 0
-        s = 0
-    else 
-        s = C / v
-    end 
-
-    h * 2 ^ 16 + s * 2 ^ 8 + v
+    h * 60
 end
 
+function get_brightness(c)
+    r,g,b = c.r, c.g, c.b
+    r + g + b
+end
 
-run()
+main()
 
 # for profiling code...
 #Profile.init(10^7, 0.01)
 
-#@profile run()
+#@profile main()
 
 #Profile.print()
