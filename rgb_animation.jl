@@ -134,12 +134,12 @@ function main_run()
                 " estimated remaining time : ", @sprintf("%0.3f", estimated_time), " minutes")
                 #", failures : $(failures), big failures : $(big_failures), resets $(resets)")
         end
-        if iter > 5000000
-            break
-        end
+        # if iter > 1000000
+        #     break
+        # end
     end
     
-    #make_images(a, OUT_DIR)
+    make_images(a, OUT_DIR)
 
 end
 
