@@ -42,7 +42,11 @@ function parse_commandline()
         "--neighbour_type"
             help = "which points do we count as neighbouring, the 6 closest (cross), or the 26 closest (cube)"
             arg_type = ASCIIString
-            default = "cube"
+            default = "cross"
+        "--smoothing_grid_side"
+            help = "how many cells to split search field into (must divide 256)"
+            arg_type = Int
+            default = 8
     end
 
     return parse_args(s)
@@ -64,6 +68,7 @@ function main_run()
     const MAX_SAMPLES = parsed_args["max_samples"]
     const SORT_TYPE = parsed_args["sort_type"]
     const NEIGHBOUR_TYPE = parsed_args["neighbour_type"]
+    const SMOOTH_GRID_SIDE = parsed_args["smoothing_grid_side"]
 
     if !ispath(OUT_DIR)
         mkdir(OUT_DIR)
@@ -88,14 +93,14 @@ function main_run()
 
     println("generating lookup grid")
 
-    grid = [DeleteArray() for x in 1:16, y = 1:16, z =1:16]
+    grid = [DeleteArray() for x in 1:SMOOTH_GRID_SIDE, y = 1:SMOOTH_GRID_SIDE, z =1:SMOOTH_GRID_SIDE]
     
 
     score_sum :: Int64 = 0
 
     for point in get_random_points(a, NUM_SEEDS)
         delete_array_add(mda, point)
-        add_to_grid(grid, point)
+        add_to_grid(grid, point, SMOOTH_GRID_SIDE)
         push!(ever_seen, point)
     end
 
@@ -105,26 +110,22 @@ function main_run()
 
     println("starting voxel placing...")
 
-    failures = 0
-    big_failures = 0
     resets = 0
 
     for c in colors
         iter += 1
         
         # TODO : get rid of index, score stuff
-        best_pt ,index, score, fail, big_fail = find_best_free_point(mda, grid,  c, big_val, MAX_SAMPLES)
-        score_sum += score
-        failures += fail
-        big_failures += big_fail
+        #best_pt ,index, score, fail, big_fail = find_best_free_point(mda, grid,  c, big_val, MAX_SAMPLES)
+        best_pt = find_best_free_point(mda, grid,  c, big_val, MAX_SAMPLES, SMOOTH_GRID_SIDE)
 
         set_color(best_pt, c)
 
         resets += delete_array_delete(mda, best_pt)
 
-        resets += delete_from_grid(grid, best_pt)
+        resets += delete_from_grid(grid, best_pt, SMOOTH_GRID_SIDE)
 
-        resets += add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, mda, ever_seen, grid)
+        resets += add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, mda, ever_seen, grid, SMOOTH_GRID_SIDE)
 
         if iter %10000 == 0
             elapsed_time = (time() - start_time) * 1.0 / 60
@@ -133,41 +134,16 @@ function main_run()
             println(iter,  ",  available points : " ,
                 delete_array_length(mda),
                 ", elapsed time : ", @sprintf("%0.3f", elapsed_time), " minutes,",
-                " estimated remaining time : ", @sprintf("%0.3f", estimated_time), " minutes",
-                ", failures : $(failures), big failures : $(big_failures), resets $(resets)")
+                " estimated remaining time : ", @sprintf("%0.3f", estimated_time), " minutes")
+                #", failures : $(failures), big failures : $(big_failures), resets $(resets)")
         end
-        if iter > 1500000
-            break
-        end
+        # if iter > 700000
+        #     break
+        # end
     end
     
     make_images(a, OUT_DIR)
 
-end
-
-function summarise_grid(grid)
-    maxx,maxy,maxz = 0,0,0
-    minx,miny,minz = 0,0,0
-    min_size = 10000000
-    max_size = 0
-    sum = 0
-    for x = 1:16,y = 1:16,z = 1:16
-        da = grid[x,y,z]
-        reset_delete_array(da)
-        size = delete_array_length(da)
-        sum += size
-        if size < min_size
-            min_size = size
-            minx,miny,minz = x,y,z
-        end
-        if size > max_size
-            max_size = size
-            maxx,maxy,maxz = x,y,z
-        end
-    end
-    max = maxx,maxy,maxz
-    min = minx,miny,minz
-    "grid stats - size : $(sum), max_cell $(max_size): $(max), min_cell : $(min_size) , $(min)"
 end
 
 type Color_
@@ -207,7 +183,11 @@ DeleteArray() = DeleteArray(Voxel[], 0, Set{Voxel}())
 function delete_array_delete(delete_array, pt)
     reset = 0
     push!(delete_array.deleted_points, pt)
-    if length(delete_array.deleted_points) / delete_array.available_size > 0.01 && length(delete_array.deleted_points) > 16
+    if length(delete_array.deleted_points) / delete_array.available_size > 0.01 && delete_array.available_size > 2  && length(delete_array.deleted_points) > 2
+        # if rand(1:10000) == 1
+        #     println(delete_array.available_size)
+        #     println(length(delete_array.deleted_points))
+        # end
         reset_delete_array(delete_array)
         reset = 1
     end
@@ -226,9 +206,14 @@ function reset_delete_array(da)
         end
     end
     da.available_size = index - 1
+
     da.deleted_points = Set{Voxel}()
+    
+    if length(da.deleted_points) > 0
+        error("deleted size error")
+    end
     if da.available_size > length(da.available_points)
-        error("size error")
+        error("available size error")
     end
 end
 
@@ -289,31 +274,38 @@ end
 # instead we check to see if the best point is in the deleted set at the end, and if so, we rerun, being more
 # careful that we don't take deleted points
 
-function find_best_free_point(da :: DeleteArray, grid :: Array{DeleteArray,3}, c,  big_val, MAX_SAMPLES)
+function find_best_free_point(da :: DeleteArray, grid :: Array{DeleteArray,3}, c,  big_val, MAX_SAMPLES, SMOOTH_GRID_SIDE)
     #available_points, deleted_points = da.available_points, da.deleted_points
     fail = 0
     big_fail = 0
 
-    best_vxl_array = get_best_vxl_set(grid, c)
+    best_vxl_array = get_best_vxl_set(grid, c, SMOOTH_GRID_SIDE)
     if delete_array_length(best_vxl_array) > 8
         array = best_vxl_array
-        samples = 32
+        samples = 128
     else
+
         array = da
         samples = MAX_SAMPLES
     end
 
-    best_pt ,index, score = find_best_point(array, c,  big_val, samples, false)
+    #best_pt ,index, score = find_best_point(array, c,  big_val, samples, false)
+    best_pt = find_best_point(array, c,  big_val, samples, false)
 
     if in(best_pt, array.deleted_points)
-        best_pt ,index, score = find_best_point(array, c,  big_val, samples, true)
+        # if rand(1:1000) == 1
+        #     println(array.available_size)
+        #     println(length(array.deleted_points))
+        # end
+        # best_pt ,index, score = find_best_point(array, c,  big_val, samples, true)
+        best_pt = find_best_point(array, c,  big_val, samples, true)
         fail = 1
     end
 
     if best_pt.x == 0
         reset_delete_array(array)
         reset_delete_array(da)
-        best_pt ,index, score = find_best_point(da, c,  big_val, MAX_SAMPLES, true)
+        best_pt  = find_best_point(da, c,  big_val, MAX_SAMPLES, true)
         big_fail = 1
     end
 
@@ -329,20 +321,22 @@ function find_best_free_point(da :: DeleteArray, grid :: Array{DeleteArray,3}, c
         error("zero point?")
     end
 
-    best_pt ,index, score, fail, big_fail
+    best_pt
 end
 
-function get_best_vxl_set(grid ::Array{DeleteArray,3}, c :: Color_)
-    r = div(c.r, 16) + 1
-    g = div(c.g, 16) + 1
-    b = div(c.b, 16) + 1
+function get_best_vxl_set(grid ::Array{DeleteArray,3}, c :: Color_, SMOOTH_GRID_SIDE)
+    side_length = 256 / SMOOTH_GRID_SIDE
+    r = div(c.r, side_length) + 1
+    g = div(c.g, side_length) + 1
+    b = div(c.b, side_length) + 1
     grid[r,g,b]
 end
 
-function get_best_vxl_set(grid ::Array{DeleteArray,3}, r,g,b)
-    r2 = div(r, 16) + 1
-    g2 = div(g, 16) + 1
-    b2 = div(b, 16) + 1
+function get_best_vxl_set(grid ::Array{DeleteArray,3}, r,g,b, SMOOTH_GRID_SIDE)
+    side_length = 256 / SMOOTH_GRID_SIDE
+    r2 = div(r, side_length) + 1
+    g2 = div(g, side_length) + 1
+    b2 = div(b, side_length) + 1
     grid[r2,g2,b2]
 end
 
@@ -364,8 +358,13 @@ function find_best_point(array :: DeleteArray,
     #  of the indices at random.  The list is getting shuffled semi regularly, so hopefully
     #  there isn't too much dependence between available points here
 
-    step_size = max(itrunc(array.available_size / MAX_SAMPLES) , 1)
-    index = rand(1 : step_size)
+    if array.available_size < MAX_SAMPLES
+        step_size = 1
+    else
+        step_size = rand(1 : array.available_size)
+    end
+    
+    index = rand(1 : array.available_size)
 
     if verbose 
         println("available size ", array.available_size, " step size " , step_size, " index ", index)
@@ -373,7 +372,9 @@ function find_best_point(array :: DeleteArray,
         println("best_score", best_score)
     end
 
-    while index <= array.available_size
+
+    for i in 1 : MAX_SAMPLES
+        index = mod(index + step_size, array.available_size)
         vxl = available_pts[index]
         index += step_size
         if !check_deleted || !in(vxl, deleted_points)
@@ -401,20 +402,21 @@ function find_best_point(array :: DeleteArray,
             end
         end
     end
-    best_pt, best_index, best_score
+    best_pt #, best_index, best_score
 end
 
 function get_color_distance(vxl :: Voxel, c :: Color_, avg :: Bool)
+    neibs = vxl.num_neighbours
     if vxl.num_neighbours == 0
         return -1073741824
     end
-    out = vxl.color_square_sum - c.r * vxl.red_sum - c.g * vxl.green_sum - c.b * vxl.blue_sum
+    out = vxl.color_square_sum + c.r * (c.r * neibs - vxl.red_sum)  + c.g * (c.g * neibs - vxl.green_sum) + (c.b * neibs - c.b * vxl.blue_sum)
 
     # integer division for small speedup
-    div(out, vxl.num_neighbours)
+    #div(out, vxl.num_neighbours)
 
     # uncomment next line if you want average assuming all the unfilled neighbours are black (gives odd effect)
-    #out
+    out
 end
 
 function set_color(vxl :: Voxel, c:: Color_)
@@ -425,7 +427,7 @@ function set_color(vxl :: Voxel, c:: Color_)
     vxl.is_coloured = true
 end
 
-function delete_from_grid(grid, pt)
+function delete_from_grid(grid, pt, SMOOTH_GRID_SIDE)
     nn = pt.num_neighbours
     if nn == 0
         r,g,b = 128,128,128
@@ -434,11 +436,11 @@ function delete_from_grid(grid, pt)
         g = div(pt.green_sum , 2 * nn)
         b = div(pt.blue_sum , 2 * nn)
     end
-    set = get_best_vxl_set(grid,r,g,b)
+    set = get_best_vxl_set(grid,r,g,b, SMOOTH_GRID_SIDE)
     delete_array_delete(set, pt)
 end
 
-function add_to_grid(grid, pt)
+function add_to_grid(grid, pt, SMOOTH_GRID_SIDE)
     nn = pt.num_neighbours
     if nn == 0
         r,g,b = 128,128,128
@@ -447,23 +449,11 @@ function add_to_grid(grid, pt)
         g = div(pt.green_sum , 2 * nn)
         b = div(pt.blue_sum , 2 * nn)
     end
-    set = get_best_vxl_set(grid,r,g,b)
+    set = get_best_vxl_set(grid,r,g,b, SMOOTH_GRID_SIDE)
     delete_array_add(set, pt)
 end
 
-# function get_color_of_vxl(vxl)
-#     nn = vxl.num_neighbours
-#     if nn == 0
-#         [128,128,128]
-#     else
-#         r = div(vxl.red_sum , 2 * nn)
-#         g = div(vxl.green_sum , 2 * nn)
-#         b = div(vxl.blue_sum , 2 * nn)
-#         [r,g,b]
-#     end
-# end
-
-function add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, da :: DeleteArray, ever_seen, grid)
+function add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, da :: DeleteArray, ever_seen, grid, SMOOTH_GRID_SIDE)
     X,Y,Z = size(a)
     x_range = max(1, best_pt.x - 1): min(X, best_pt.x + 1)
     y_range = max(1, best_pt.y - 1): min(Y, best_pt.y + 1)
@@ -473,24 +463,24 @@ function add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, da :: DeleteArr
     if NEIGHBOUR_TYPE == "cube"
         for x = x_range, y = y_range, z = z_range
             pt = a[x, y, mod(z, Z)]
-            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid) 
+            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid, SMOOTH_GRID_SIDE) 
         end
 
     elseif NEIGHBOUR_TYPE == "cross"
         #probably a nicer way of doing this...
         for x = x_range
             pt = a[x, best_pt.y, mod(best_pt.z , Z)]
-            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid) 
+            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid, SMOOTH_GRID_SIDE) 
         end
 
         for y = y_range
             pt = a[best_pt.x, y, mod(best_pt.z , Z)]
-            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid) 
+            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid, SMOOTH_GRID_SIDE) 
         end
         
         for z = z_range
             pt = a[best_pt.x, best_pt.y, mod(z , Z)]
-            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid) 
+            out_int += color_neighbour_and_update_sets(pt, c, da, ever_seen, grid, SMOOTH_GRID_SIDE) 
         end
     else
         error("bad neighbour type argument : $(NEIGHBOUR_TYPE)")
@@ -498,7 +488,7 @@ function add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, da :: DeleteArr
     out_int
 end
 
-function color_neighbour_and_update_sets(pt, c, da :: DeleteArray, ever_seen, grid)
+function color_neighbour_and_update_sets(pt, c, da :: DeleteArray, ever_seen, grid, SMOOTH_GRID_SIDE)
     out_int = 0
     if !pt.is_coloured
         nn = pt.num_neighbours
@@ -509,16 +499,17 @@ function color_neighbour_and_update_sets(pt, c, da :: DeleteArray, ever_seen, gr
             g1 = div(pt.green_sum , 2 * nn)
             b1 = div(pt.blue_sum , 2 * nn)
         end
-        set1 = get_best_vxl_set(grid,r1,g1,b1)
+        set1 = get_best_vxl_set(grid,r1,g1,b1, SMOOTH_GRID_SIDE)
         add_neighbour_color(pt, c)
         r2 = div(pt.red_sum , 2 * pt.num_neighbours)
         g2 = div(pt.green_sum , 2 * pt.num_neighbours)
         b2 = div(pt.blue_sum , 2 * pt.num_neighbours)
-        set2 = get_best_vxl_set(grid,r2,g2,b2)
+        set2 = get_best_vxl_set(grid,r2,g2,b2, SMOOTH_GRID_SIDE)
         if set1 != set2
             if pt in set2.deleted_points
                 reset_delete_array(set2)
                 out_int += 1
+
             end
             out_int += delete_array_delete(set1, pt)
             delete_array_add(set2, pt)
