@@ -32,7 +32,7 @@ function parse_commandline()
             arg_type = Int
             default = 10
         "--max_samples"
-            help = "maximum number of samples to take per iteration"
+            help = "maximum number of samples to take per iteration (when we don't/can't use rgb-grid)"
             arg_type = Int
             default = 1024
         "--sort_type"
@@ -43,10 +43,17 @@ function parse_commandline()
             help = "which points do we count as neighbouring, the 6 closest (cross), or the 26 closest (cube)"
             arg_type = ASCIIString
             default = "cross"
+        "--use_grid"
+            help = "should we use the rgb_grid to help place colours"
+            arg_type = Bool
+            default = true
         "--smoothing_grid_side"
             help = "how many cells to split search field into (must divide 256)"
             arg_type = Int
             default = 8
+        "--average_type"
+            help = "what average type do we use on the neighbours, l_inf, l_2, l_2_avg will work"
+            default = "l_inf"
     end
 
     return parse_args(s)
@@ -69,6 +76,13 @@ function main_run()
     const SORT_TYPE = parsed_args["sort_type"]
     const NEIGHBOUR_TYPE = parsed_args["neighbour_type"]
     const SMOOTH_GRID_SIDE = parsed_args["smoothing_grid_side"]
+    const AVERAGE_TYPE = parsed_args["average_type"]
+
+    ## TODO : don't create/update grid if not using it
+    const USE_GRID = parsed_args["use_grid"]
+
+    l_inf,avg = get_average_params(AVERAGE_TYPE)
+    println(l_inf, avg)
 
     if !ispath(OUT_DIR)
         mkdir(OUT_DIR)
@@ -86,17 +100,12 @@ function main_run()
     #  be expensive, we keep track of those that we have deleted, and periodically refresh the
     #  available set list without the deleted points.  Finally, we keep track of those that we 
     #  have ever added to make sure we 
-    
-    #main delete array
+
     mda = DeleteArray()
     ever_seen = Set{Voxel}()
 
     println("generating lookup grid")
-
     grid = [DeleteArray() for x in 1:SMOOTH_GRID_SIDE, y = 1:SMOOTH_GRID_SIDE, z =1:SMOOTH_GRID_SIDE]
-    
-
-    score_sum :: Int64 = 0
 
     for point in get_random_points(a, NUM_SEEDS)
         delete_array_add(mda, point)
@@ -115,12 +124,12 @@ function main_run()
     for c in colors
         iter += 1
         
-        # TODO : get rid of index, score stuff
-        #best_pt ,index, score, fail, big_fail = find_best_free_point(mda, grid,  c, big_val, MAX_SAMPLES)
-        best_pt = find_best_free_point(mda, grid,  c, big_val, MAX_SAMPLES, SMOOTH_GRID_SIDE)
+        best_pt = find_best_free_point(mda, grid,  c, big_val, MAX_SAMPLES, SMOOTH_GRID_SIDE, l_inf,avg, USE_GRID)
 
         set_color(best_pt, c)
 
+        ## TODO : currently we are counting the number of resets of the arrays (for profiling) but not outputting it
+        ## anywhere, delete?
         resets += delete_array_delete(mda, best_pt)
 
         resets += delete_from_grid(grid, best_pt, SMOOTH_GRID_SIDE)
@@ -128,6 +137,8 @@ function main_run()
         resets += add_colors_to_neighbours(NEIGHBOUR_TYPE, a, best_pt, c, mda, ever_seen, grid, SMOOTH_GRID_SIDE)
 
         if iter %10000 == 0
+
+            ## TODO : make estimated time a bit more sophisticated
             elapsed_time = (time() - start_time) * 1.0 / 60
             estimated_time = (SIDE * SIDE * FRAMES - iter) * elapsed_time / iter
 
@@ -135,15 +146,27 @@ function main_run()
                 delete_array_length(mda),
                 ", elapsed time : ", @sprintf("%0.3f", elapsed_time), " minutes,",
                 " estimated remaining time : ", @sprintf("%0.3f", estimated_time), " minutes")
-                #", failures : $(failures), big failures : $(big_failures), resets $(resets)")
         end
-        # if iter > 700000
-        #     break
-        # end
     end
     
     make_images(a, OUT_DIR)
 
+end
+
+function get_average_params(avg_type)
+    if beginswith(avg_type,"l_inf")
+        l_inf = true
+    elseif beginswith(avg_type,"l_2")
+        l_inf = false
+    else 
+        Error("bad average parameter")
+    end
+    if endswith(avg_type,"avg")
+        avg = true
+    else
+        avg = false
+    end
+    l_inf,avg
 end
 
 type Color_
@@ -152,6 +175,7 @@ type Color_
     b :: Uint8
 end
 
+## damn Americans, screwing up my spelling....
 Color_() = Color_(-1,-1,-1)
 
 # we store the color of the voxel, and the sum of the norms, and sum of 
@@ -184,10 +208,6 @@ function delete_array_delete(delete_array, pt)
     reset = 0
     push!(delete_array.deleted_points, pt)
     if length(delete_array.deleted_points) / delete_array.available_size > 0.01 && delete_array.available_size > 2  && length(delete_array.deleted_points) > 2
-        # if rand(1:10000) == 1
-        #     println(delete_array.available_size)
-        #     println(length(delete_array.deleted_points))
-        # end
         reset_delete_array(delete_array)
         reset = 1
     end
@@ -261,75 +281,55 @@ end
 function get_random_points(a :: Array{Voxel}, n :: Int64)
     out = Set{Voxel}()
     X,Y,Z = size(a)
-    for i in 1:n
-        x = rand(1:X)
-        y = rand(1:Y)
-        z = rand(1:Z)
+    if n ==0
+        x = X/2
+        y = Y/2
+        z = Z/2
         push!(out, a[x, y, z])
+    else
+        for i in 1:n
+            x = rand(1:X)
+            y = rand(1:Y)
+            z = rand(1:Z)
+            push!(out, a[x, y, z])
+        end
     end
     out
 end
 
-# by default we don't check if the point is in the deleted pointed set, as this ends up being a bottleneck,
+# by default we don't check if each point is in the deleted pointed set, as this ends up being a bottleneck,
 # instead we check to see if the best point is in the deleted set at the end, and if so, we rerun, being more
 # careful that we don't take deleted points
-
-function find_best_free_point(da :: DeleteArray, grid :: Array{DeleteArray,3}, c,  big_val, MAX_SAMPLES, SMOOTH_GRID_SIDE)
-    #available_points, deleted_points = da.available_points, da.deleted_points
-    fail = 0
-    big_fail = 0
+function find_best_free_point(da :: DeleteArray, grid :: Array{DeleteArray,3}, c,  
+                        big_val, MAX_SAMPLES, SMOOTH_GRID_SIDE, l_inf :: Bool ,avg :: Bool, USE_GRID :: Bool)
 
     best_vxl_array = get_best_vxl_set(grid, c, SMOOTH_GRID_SIDE)
-    if delete_array_length(best_vxl_array) > 8
+    if delete_array_length(best_vxl_array) > 8 && USE_GRID
         array = best_vxl_array
-        samples = 128
+        samples = 32
     else
-
         array = da
         samples = MAX_SAMPLES
     end
 
-    #best_pt ,index, score = find_best_point(array, c,  big_val, samples, false)
-    best_pt = find_best_point(array, c,  big_val, samples, false)
+    best_pt = find_best_point(array, c,  big_val, samples, false, l_inf ,avg)
 
     if in(best_pt, array.deleted_points)
-        # if rand(1:1000) == 1
-        #     println(array.available_size)
-        #     println(length(array.deleted_points))
-        # end
-        # best_pt ,index, score = find_best_point(array, c,  big_val, samples, true)
-        best_pt = find_best_point(array, c,  big_val, samples, true)
-        fail = 1
+        best_pt = find_best_point(array, c,  big_val, samples, true, l_inf ,avg)
     end
 
+    # don't think this is required any more....
     if best_pt.x == 0
         reset_delete_array(array)
         reset_delete_array(da)
-        best_pt  = find_best_point(da, c,  big_val, MAX_SAMPLES, true)
-        big_fail = 1
-    end
-
-    if best_pt.x == 0
-        #samples = length(array.available_points)
-        println("num available points : ", delete_array_length(best_vxl_array),
-            ", ", delete_array_length(da) )
-
-        println("check one " , length(best_vxl_array.available_points) - length(best_vxl_array.deleted_points))
-        println("check two " , length(da.available_points) - length(da.deleted_points))
-        find_best_point(da, c,  big_val, MAX_SAMPLES, true, verbose = true)
-
-        error("zero point?")
+        best_pt  = find_best_point(da, c,  big_val, MAX_SAMPLES, true, l_inf ,avg)
     end
 
     best_pt
 end
 
-function get_best_vxl_set(grid ::Array{DeleteArray,3}, c :: Color_, SMOOTH_GRID_SIDE)
-    side_length = 256 / SMOOTH_GRID_SIDE
-    r = div(c.r, side_length) + 1
-    g = div(c.g, side_length) + 1
-    b = div(c.b, side_length) + 1
-    grid[r,g,b]
+function get_best_vxl_set(grid ::Array{DeleteArray,3}, c:: Color_, SMOOTH_GRID_SIDE)
+    get_best_vxl_set(grid ::Array{DeleteArray,3}, c.r,c.g,c.b, SMOOTH_GRID_SIDE)
 end
 
 function get_best_vxl_set(grid ::Array{DeleteArray,3}, r,g,b, SMOOTH_GRID_SIDE)
@@ -343,7 +343,8 @@ end
 const empty_vxl = Voxel(convert(Int32,0),convert(Int32,0),convert(Int32,0))
 
 function find_best_point(array :: DeleteArray, 
-        c :: Color_, big_val :: Int32, MAX_SAMPLES, check_deleted :: Bool; verbose= false)
+        c :: Color_, big_val :: Int32, MAX_SAMPLES, check_deleted :: Bool,
+        l_inf :: Bool ,avg :: Bool; verbose= false)
     available_pts  = array.available_points
     deleted_points  = array.deleted_points
     
@@ -355,8 +356,7 @@ function find_best_point(array :: DeleteArray,
 
     #  I found that randomly sampling the available points was too slow (may be that 
     #  I was using the wrong function though).  Instead, I iterate through an arithmetic progression
-    #  of the indices at random.  The list is getting shuffled semi regularly, so hopefully
-    #  there isn't too much dependence between available points here
+    #  of the indices at random. 
 
     if array.available_size < MAX_SAMPLES
         step_size = 1
@@ -379,7 +379,7 @@ function find_best_point(array :: DeleteArray,
         index += step_size
         if !check_deleted || !in(vxl, deleted_points)
 
-            score = get_color_distance(vxl, c, true)
+            score = get_color_distance(vxl, c, l_inf ,avg)
             if verbose
                 println(score)
             end
@@ -390,7 +390,7 @@ function find_best_point(array :: DeleteArray,
                     best_pt = vxl
                     best_index = index
                 
-                #reservoir sampling, to make the order of available points less important
+                #reservoir sampling, to make the order of available points less important (completely unnecessary?)
                 else
                     if rand(1:n) == 1
                         n += 1
@@ -402,20 +402,29 @@ function find_best_point(array :: DeleteArray,
             end
         end
     end
-    best_pt #, best_index, best_score
+    best_pt 
 end
 
-function get_color_distance(vxl :: Voxel, c :: Color_, avg :: Bool)
-    neibs = vxl.num_neighbours
+function get_color_distance(vxl :: Voxel, c :: Color_, l_inf :: Bool ,avg :: Bool)
+    nn = vxl.num_neighbours
     if vxl.num_neighbours == 0
         return -1073741824
     end
-    out = vxl.color_square_sum + c.r * (c.r * neibs - vxl.red_sum)  + c.g * (c.g * neibs - vxl.green_sum) + (c.b * neibs - c.b * vxl.blue_sum)
+    
+    r = div(vxl.red_sum , 2 * nn)
+    g = div(vxl.green_sum , 2 * nn)
+    b = div(vxl.blue_sum , 2 * nn)
 
-    # integer division for small speedup
-    #div(out, vxl.num_neighbours)
+    if l_inf
+        out =  max(abs(c.r - r),abs(c.g - g),abs(c.b - b))
+    else
+        ## this should give the total sum of the L2 norms (less the norm of c, which we don't care about if we average)
+        out = vxl.color_square_sum - c.r * vxl.red_sum  - c.g * vxl.green_sum - c.b * vxl.blue_sum
+    end
+    if avg
+        out = div(out, vxl.num_neighbours)
+    end
 
-    # uncomment next line if you want average assuming all the unfilled neighbours are black (gives odd effect)
     out
 end
 
@@ -491,13 +500,14 @@ end
 function color_neighbour_and_update_sets(pt, c, da :: DeleteArray, ever_seen, grid, SMOOTH_GRID_SIDE)
     out_int = 0
     if !pt.is_coloured
-        nn = pt.num_neighbours
-        if nn == 0
+        if pt.num_neighbours == 0
             r1,g1,b1 = 128,128,128
         else
-            r1 = div(pt.red_sum , 2 * nn)
-            g1 = div(pt.green_sum , 2 * nn)
-            b1 = div(pt.blue_sum , 2 * nn)
+            ## returning r,g,b from a single function seems to have a high memory cost
+            ## so we unroll these calculations manually
+            r1 = div(pt.red_sum , 2 * pt.num_neighbours)
+            g1 = div(pt.green_sum , 2 * pt.num_neighbours)
+            b1 = div(pt.blue_sum , 2 * pt.num_neighbours)
         end
         set1 = get_best_vxl_set(grid,r1,g1,b1, SMOOTH_GRID_SIDE)
         add_neighbour_color(pt, c)
@@ -506,10 +516,11 @@ function color_neighbour_and_update_sets(pt, c, da :: DeleteArray, ever_seen, gr
         b2 = div(pt.blue_sum , 2 * pt.num_neighbours)
         set2 = get_best_vxl_set(grid,r2,g2,b2, SMOOTH_GRID_SIDE)
         if set1 != set2
+            ## if we have already deleted the pt from set2, we are in trouble, since we won't 
+            ## register it if we have to put it back in, so we reset the array.
             if pt in set2.deleted_points
                 reset_delete_array(set2)
                 out_int += 1
-
             end
             out_int += delete_array_delete(set1, pt)
             delete_array_add(set2, pt)
@@ -523,6 +534,8 @@ function color_neighbour_and_update_sets(pt, c, da :: DeleteArray, ever_seen, gr
     out_int
 end
 
+## we are really just adding just enough information that we can calculate the 
+## distance to a new colour quickly (one calculation rather than an interation)
 function add_neighbour_color(vxl :: Voxel, c:: Color_)
     vxl.num_neighbours += 1
     vxl.color_square_sum += c.r * c.r + c.g * c.g + c.b * c.b
@@ -548,7 +561,6 @@ function make_images(a :: Array{Voxel,3}, out_dir)
         im_array :: Array{Uint8,3} = [get_colour(vxl_array[x,y],i) for x = 1 : X, y = 1: Y, i = 1 : 3]
         Images.imwrite(Images.colorim(im_array),"$(out_dir)/test_$(dec(z, 4)).png")
     end
-
     println("time to make images : ", 
         @sprintf("%0.3f", (time() - image_start_time) * 1.0 / 60), " minutes.")
     println("finished!")
@@ -567,7 +579,7 @@ function get_colour(vxl :: Voxel, i )
     end
 end
 
-##  TODO : check this
+##  TODO : check this...
 function get_hue(c)
     r,g,b = c.r, c.g, c.b
     R = r / 256
@@ -591,7 +603,6 @@ function get_hue(c)
     if h < 0
        h += 6
     end
-
     h * 60
 end
 
@@ -600,15 +611,12 @@ function get_brightness(c)
     r + g + b
 end
 
-#main_run()
+main_run()
 
 # for profiling code...
-Profile.init(10^7, 0.1)
+# Profile.init(10^7, 0.1)
 
 
-@profile main_run()
+# @profile main_run()
 
-Profile.print()
-
-
-
+# Profile.print()
